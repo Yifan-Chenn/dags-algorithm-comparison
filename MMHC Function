@@ -1,0 +1,248 @@
+import numpy as np
+import itertools
+import networkx as nx
+from scipy.stats import norm
+#define MMHC function
+
+# 1. Fisher Z CI test with caching
+
+def fisher_z_ci(X, i, j, cond_set, cache, alpha_guard=True):
+    key = (min(i, j), max(i, j), tuple(sorted(cond_set)))
+    if key in cache:
+        return cache[key]
+
+    n, d = X.shape
+    S = list(cond_set)
+
+    if len(S) == 0:
+        r = np.corrcoef(X[:, i], X[:, j])[0, 1]
+    else:
+        Z = X[:, S]
+        beta_i, *_ = np.linalg.lstsq(Z, X[:, i], rcond=None)
+        beta_j, *_ = np.linalg.lstsq(Z, X[:, j], rcond=None)
+        resid_i = X[:, i] - Z @ beta_i
+        resid_j = X[:, j] - Z @ beta_j
+        r = np.corrcoef(resid_i, resid_j)[0, 1]
+
+    r = np.clip(r, -0.999999, 0.999999)
+
+    eff_n = n - len(S) - 3
+    if eff_n <= 0:
+        # not enough samples - treat as dependent to be conservative
+        p = 0.0
+    else:
+        z = 0.5 * np.sqrt(eff_n) * np.log((1 + r) / (1 - r))
+        p = 2 * (1 - norm.cdf(abs(z)))
+
+    cache[key] = p
+    return p
+
+# 2. Max–Min association (MMPC core)
+
+def max_min_assoc(X, target, candidates, PC, ci_cache, max_k=3):
+    scores = {}
+    PC_list = list(PC)
+
+    for x in candidates:
+        best_assoc = 0.0
+        max_subset_size = min(len(PC_list), max_k)
+
+        for k in range(max_subset_size + 1):
+            for S in itertools.combinations(PC_list, k):
+                p = fisher_z_ci(X, target, x, S, ci_cache)
+                assoc = 1.0 - p
+                if assoc > best_assoc:
+                    best_assoc = assoc
+
+        scores[x] = best_assoc
+
+    return scores
+
+# 3. MMPC (forward + backward) for continuous data
+
+def mmpc_continuous_optimized(X, alpha=0.05, max_k=3):
+    n, d = X.shape
+    ci_cache = {}
+    PCs = {i: set() for i in range(d)}
+
+    for target in range(d):
+        PC = set()
+        candidates = set(range(d)) - {target}
+
+        # forward phase
+        while True:
+            if not candidates:
+                break
+
+            scores = max_min_assoc(X, target, candidates, PC, ci_cache, max_k=max_k)
+            # pick variable with max MinAssoc
+            best_var = max(scores, key=scores.get)
+            # unconditional test for stopping rule
+            p0 = fisher_z_ci(X, target, best_var, [], ci_cache)
+
+            if p0 < alpha:
+                PC.add(best_var)
+                candidates.remove(best_var)
+            else:
+                # if best candidate is already independent unconditionally,
+                # stop growing
+                break
+
+        # backward phase
+        changed = True
+        while changed:
+            changed = False
+            for x in list(PC):
+                other_PC = list(PC - {x})
+                max_subset_size = min(len(other_PC), max_k)
+
+                independent = False
+                for k in range(max_subset_size + 1):
+                    for S in itertools.combinations(other_PC, k):
+                        p = fisher_z_ci(X, target, x, S, ci_cache)
+                        if p > alpha:
+                            PC.remove(x)
+                            changed = True
+                            independent = True
+                            break
+                    if independent:
+                        break
+
+        PCs[target] = PC
+
+    return PCs
+
+
+# 4. Skeleton from symmetric PCs
+
+def skeleton_from_PC(PCs, d):
+    A_skel = np.zeros((d, d), dtype=int)
+    for i in range(d):
+        for j in PCs[i]:
+            if i in PCs[j]:
+                A_skel[i, j] = 1
+                A_skel[j, i] = 1
+    return A_skel
+
+# 5. Local Gaussian BIC and hill-climbing
+
+def local_gaussian_bic(X, j, parents):
+    n, d = X.shape
+    parents = list(parents)
+    if len(parents) == 0:
+        var = np.var(X[:, j])
+        var = max(var, 1e-12)
+        loglik = - (n / 2) * np.log(var)
+        k = 1  # variance parameter
+    else:
+        Z = X[:, parents]
+        beta, *_ = np.linalg.lstsq(Z, X[:, j], rcond=None)
+        resid = X[:, j] - Z @ beta
+        var = np.var(resid)
+        var = max(var, 1e-12)
+        loglik = - (n / 2) * np.log(var)
+        k = len(parents) + 1  # parents + variance
+
+    bic = loglik - (k / 2) * np.log(n)
+    return bic
+
+
+def hill_climb_gaussian_optimized(X, A_skel, max_iter=200):
+    n, d = X.shape
+    A = np.zeros((d, d), dtype=int)
+    parents = [set() for _ in range(d)]
+    local_scores = np.zeros(d)
+
+    # initial scores (empty parents)
+    for j in range(d):
+        local_scores[j] = local_gaussian_bic(X, j, parents[j])
+
+    for it in range(max_iter):
+        best_delta = 0.0
+        best_move = None  # (type, i, j)
+
+        # Try all moves
+        for i in range(d):
+            for j in range(d):
+                if i == j:
+                    continue
+
+                # 1) Add i->j if allowed by skeleton and not already present
+                if A_skel[i, j] == 1 and A[i, j] == 0 and A[j, i] == 0:
+                    # tentative parents for j
+                    new_parents_j = parents[j] | {i}
+                    # cycle check
+                    A_try = A.copy()
+                    A_try[i, j] = 1
+                    if nx.is_directed_acyclic_graph(nx.DiGraph(A_try)):
+                        new_score_j = local_gaussian_bic(X, j, new_parents_j)
+                        delta = new_score_j - local_scores[j]
+                        if delta > best_delta + 1e-10:
+                            best_delta = delta
+                            best_move = ("add", i, j)
+
+                # 2) Delete i->j if present
+                if A[i, j] == 1:
+                    new_parents_j = parents[j] - {i}
+                    new_score_j = local_gaussian_bic(X, j, new_parents_j)
+                    delta = new_score_j - local_scores[j]
+                    if delta > best_delta + 1e-10:
+                        best_delta = delta
+                        best_move = ("del", i, j)
+
+                # 3) Reverse i->j to j->i if edge exists and skeleton allows j--i
+                if A[i, j] == 1 and A_skel[j, i] == 1:
+                    new_parents_i = parents[i] | {j}
+                    new_parents_j = parents[j] - {i}
+
+                    A_try = A.copy()
+                    A_try[i, j] = 0
+                    A_try[j, i] = 1
+                    if nx.is_directed_acyclic_graph(nx.DiGraph(A_try)):
+                        new_score_i = local_gaussian_bic(X, i, new_parents_i)
+                        new_score_j = local_gaussian_bic(X, j, new_parents_j)
+                        delta = (new_score_i - local_scores[i]) + \
+                                (new_score_j - local_scores[j])
+                        if delta > best_delta + 1e-10:
+                            best_delta = delta
+                            best_move = ("rev", i, j)
+
+        # Apply best move
+        if best_move is None or best_delta <= 0:
+            break  # local optimum
+
+        move_type, i, j = best_move
+        if move_type == "add":
+            A[i, j] = 1
+            parents[j].add(i)
+            local_scores[j] = local_gaussian_bic(X, j, parents[j])
+        elif move_type == "del":
+            A[i, j] = 0
+            parents[j].remove(i)
+            local_scores[j] = local_gaussian_bic(X, j, parents[j])
+        elif move_type == "rev":
+            A[i, j] = 0
+            A[j, i] = 1
+            parents[j].remove(i)
+            parents[i].add(j)
+            local_scores[j] = local_gaussian_bic(X, j, parents[j])
+            local_scores[i] = local_gaussian_bic(X, i, parents[i])
+
+    return A
+
+
+# 6. Top-level optimized MMHC (continuous)
+
+def run_mmhc_continuous_optimized(X, alpha=0.05, max_k=2, max_iter=200):
+    X = np.asarray(X)
+    n, d = X.shape
+
+    # MMPC
+    PCs = mmpc_continuous_optimized(X, alpha=alpha, max_k=max_k)
+
+    # skeleton
+    A_skel = skeleton_from_PC(PCs, d)
+
+    # HC orientation
+    A_hat = hill_climb_gaussian_optimized(X, A_skel, max_iter=max_iter)
+    return A_hat
